@@ -1,5 +1,38 @@
-#!/usr/bin/env python
-# coding=utf-8
+"""Script to finetune a model on a causal language modeling task.
+# Example for debugging
+ACCELERATE_CONFIG_FILE=/env/lib/repos/wbr/self-rag/launcher/accelerate_singlegpu.yaml
+MODEL_NAME=Self-GRIT/tiny-random-llama3
+DATASET=Self-GRIT/selfrag_train_data_tiny
+NUM_WORKERS=1
+BATCH_SIZE_PER_GPU=1
+TOTAL_BATCH_SIZE=128
+LR=2e-5
+SCHEDULER_TYPE=linear
+WARMUP_RATIO=0.03
+WD=0.0
+MAX_STEPS=10
+NUM_GPUS=1
+OUTPUT_DIR=/data/wberriosr/self-rag/test
+GRADIENT_ACC_STEPS=$(($TOTAL_BATCH_SIZE/$NUM_GPUS/$BATCH_SIZE_PER_GPU))
+python -u -m accelerate.commands.launch --config_file $ACCELERATE_CONFIG_FILE \
+    finetune.py \
+    --model_name_or_path $MODEL_NAME \
+    --dataset_name $DATASET \
+    --tokenizer_name $MODEL_NAME \
+    --use_slow_tokenizer \
+    --max_seq_length 2048 \
+    --preprocessing_num_workers $NUM_WORKERS \
+    --per_device_train_batch_size $BATCH_SIZE_PER_GPU \
+    --gradient_accumulation_steps $GRADIENT_ACC_STEPS \
+    --learning_rate $LR \
+    --lr_scheduler_type $SCHEDULER_TYPE \
+    --warmup_ratio $WARMUP_RATIO \
+    --weight_decay $WD \
+    --max_train_steps $MAX_STEPS \
+    --output_dir $OUTPUT_DIR \
+    --logging_steps 1 \
+    --use_special_tokens   
+"""
 
 import argparse
 import logging
@@ -33,7 +66,6 @@ from transformers import (
     GPT2Tokenizer,
     OPTForCausalLM
 )
-from peft import LoraConfig, TaskType, get_peft_model
 
 logger = get_logger(__name__)
 
@@ -76,23 +108,7 @@ def parse_args():
         default=None,
         help="Pretrained config name or path if not the same as model_name",
     )
-    parser.add_argument(
-        "--use_lora",
-        action="store_true",
-        help="If passed, will use LORA (low-rank parameter-efficient training) to train the model.",
-    )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=64,
-        help="The rank of lora.",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=float,
-        default=16,
-        help="The alpha parameter of lora.",
-    )
+
     parser.add_argument(
         "--lora_dropout",
         type=float,
@@ -238,8 +254,6 @@ def _tokenize_fn(text: str, tokenizer: transformers.PreTrainedTokenizer, max_seq
             truncation=True,
     ).input_ids
     input_ids_lens = labels_lens = input_ids.ne(tokenizer.pad_token_id).sum().item()
-    print(input_ids_lens)
-
     return dict(
         input_ids=input_ids,
         labels=labels,
@@ -290,66 +304,6 @@ def encode_with_prompt_completion_format(example, tokenizer, max_seq_length, con
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten()
     }
-
-def encode_with_messages_format(example, tokenizer, max_seq_length):
-    '''
-    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
-    We concatenate all messages with the roles as delimiters and tokenize them together.
-    '''
-    messages = example['messages']
-    if len(messages) == 0:
-        raise ValueError('messages field is empty.')
-    
-    def _concat_messages(messages):
-        message_text = ""
-        for message in messages:
-            if message["role"] == "system":
-                message_text += "<|system|>\n" + message["content"].strip() + "\n"
-            elif message["role"] == "user":
-                message_text += "<|user|>\n" + message["content"].strip() + "\n"
-            elif message["role"] == "assistant":
-                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
-            else:
-                raise ValueError("Invalid role: {}".format(message["role"]))
-        return message_text
-        
-    example_text = _concat_messages(messages).strip()
-    tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
-
-    # mask the non-assistant part for avoiding loss
-    for message_idx, message in enumerate(messages):
-        if message["role"] != "assistant":
-            if message_idx == 0:
-                message_start_idx = 0
-            else:
-                message_start_idx = tokenizer(
-                    _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length, truncation=True
-                ).input_ids.shape[1]
-            if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
-                # here we also ignore the role of the assistant
-                messages_so_far = _concat_messages(messages[:message_idx+1]) + "<|assistant|>\n"
-            else:
-                messages_so_far = _concat_messages(messages[:message_idx+1])
-            message_end_idx = tokenizer(
-                messages_so_far,
-                return_tensors='pt', 
-                max_length=max_seq_length, 
-                truncation=True
-            ).input_ids.shape[1]
-            labels[:, message_start_idx:message_end_idx] = -100
-            
-            if message_end_idx >= max_seq_length:
-                break
-
-    attention_mask = torch.ones_like(input_ids)
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
-        
 
 def main():
     args = parse_args()
@@ -448,9 +402,6 @@ def main():
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
         if args.use_special_tokens is True:
             special_token_dict = {"additional_special_tokens": ["[No Retrieval]", "[Retrieval]", "[Continue to Use Evidence]", "[Irrelevant]", "[Relevant]", "<paragraph>", "</paragraph>", "[Utility:1]", "[Utility:2]", "[Utility:3]", "[Utility:4]", "[Utility:5]", "[Fully supported]", "[Partially supported]", "[No support / Contradictory]"]}
-        special_token_dict["bos_token"] = "<s>"
-        special_token_dict["eos_token"] = "</s>"
-        special_token_dict["unk_token"] = "<unk>"
         special_token_dict["pad_token"] = "<pad>"
         num_added_tokens = tokenizer.add_special_tokens(special_token_dict)
         
@@ -461,6 +412,7 @@ def main():
             assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
         else:
             assert num_added_tokens > 10, "special tokens must be added to the original tokenizers."
+    
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
         num_added_tokens = tokenizer.add_special_tokens({
             "pad_token": "<pad>",
@@ -468,26 +420,28 @@ def main():
         assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
     elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
         num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    
+    elif ("llama3" in args.model_name_or_path) or ("llama-3" in args.model_name_or_path):
+        if args.use_special_tokens is True:
+            special_token_dict = {"additional_special_tokens": ["[No Retrieval]", "[Retrieval]", "[Continue to Use Evidence]", "[Irrelevant]", "[Relevant]", "<paragraph>", "</paragraph>", "[Utility:1]", "[Utility:2]", "[Utility:3]", "[Utility:4]", "[Utility:5]", "[Fully supported]", "[Partially supported]", "[No support / Contradictory]"]}
+        special_token_dict["pad_token"] = "<pad>"
+        num_added_tokens = tokenizer.add_special_tokens(special_token_dict)
+        
+        context_markups = []
+        for token in ["<paragraph>", "</paragraph>"]:
+            context_markups.append(tokenizer.convert_tokens_to_ids(token))
+        if args.use_special_tokens is False:
+            assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+        else:
+            assert num_added_tokens > 10, "special tokens must be added to the original tokenizers."
+    
+
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
-
-    if args.use_lora:
-        logger.info("Initializing LORA model...")
-        modules_to_save = ["embed_tokens"]
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, 
-            inference_mode=False, 
-            r=args.lora_rank, 
-            #modules_to_save=modules_to_save,
-            lora_alpha=args.lora_alpha, 
-            lora_dropout=args.lora_dropout
-        )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
 
 
     encode_function = partial(
@@ -496,12 +450,7 @@ def main():
         max_seq_length=args.max_seq_length,
         context_markups=context_markups if args.use_special_tokens is True else None
     )
-    # elif "messages" in raw_datasets["train"].column_names:
-    #     encode_function = partial(
-    #         encode_with_messages_format,
-    #         tokenizer=tokenizer,
-    #         max_seq_length=args.max_seq_length,
-    #     )
+
     with accelerator.main_process_first():
         lm_datasets = raw_datasets.map(
             encode_function,
@@ -515,23 +464,19 @@ def main():
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
 
     train_dataset = lm_datasets["train"]
-    print(train_dataset[0])
-    print(train_dataset[1000])
-    print(train_dataset[500])
-    print(train_dataset[2000])
-    print(train_dataset[10000])
+
+    
     with open("processed.json", "w") as outfile:
         new_data = []
         for item in train_dataset:
-            print(item)
             labels = [int(i) for i in item["labels"]]
             input_ids = [int(i) for i in item["input_ids"]]
             new_data.append({"labels": labels, "input_ids": input_ids})
         json.dump(new_data, outfile)
     # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
+    #for index in random.sample(range(len(train_dataset)), 3):
+    #    logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    
     # DataLoaders creation:
     train_dataloader = DataLoader(
         train_dataset, 
@@ -711,16 +656,10 @@ def main():
         # Otherwise, sometimes the model will be saved with only part of the parameters.
         # Also, accelerator needs to use the wrapped model to get the state_dict.
         state_dict = accelerator.get_state_dict(model)
-        if args.use_lora:
-            # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process 
-            # and has its own save_pretrained function for only saving lora modules.
-            # We have to mannually specify the is_main_process outside the save_pretrained function.
-            if accelerator.is_main_process:
-                unwrapped_model.save_pretrained(args.output_dir, state_dict=state_dict)
-        else:
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict
-            )
+
+        unwrapped_model.save_pretrained(
+            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict
+        )
 
 if __name__ == "__main__":
     main()
