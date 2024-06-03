@@ -1,3 +1,31 @@
+"""
+# PopQA
+cd /env/lib/repos/wbr/Self-GRIT/self-rag/retrieval_lm
+conda activate wbr-self-rag
+CUDA_VISIBLE_DEVICES=1 python run_baseline_lm.py \
+--model_name /data/models/hf_llama2_7b \
+--input_file eval_data/popqa_longtail_w_gs.jsonl \
+ --max_new_tokens 100 --metric match \
+--result_fp repros/repro_llama2_baseline --task qa \
+--mode retrieval \
+--prompt_name "prompt_no_input_retrieval" \
+--top_n 1
+
+# TriviaQA
+
+cd /env/lib/repos/wbr/Self-GRIT/self-rag/retrieval_lm
+conda activate wbr-self-rag
+CUDA_VISIBLE_DEVICES=1 python run_baseline_lm.py \
+--model_name /data/models/hf_llama2_7b \
+--input_file eval_data/triviaqa_test_w_gs.jsonl \
+ --max_new_tokens 100 --metric match \
+--result_fp repros/repro_triviaqa_llama2_baseline --task qa \
+--mode retrieval \
+--prompt_name "prompt_no_input_retrieval" \
+--top_n 10 --batch_size 16
+
+"""
+
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -50,7 +78,7 @@ def call_model_instructgpt(prompt, model, max_tokens=50):
 def call_model(prompts, model, max_new_tokens=50):
     sampling_params = SamplingParams(
         temperature=0.8, top_p=0.95, max_tokens=max_new_tokens)
-    preds = model.generate(prompts, sampling_params)
+    preds = model.generate(prompts, sampling_params,use_tqdm=False)
     preds = [pred.outputs[0].text.split("\n\n")[0] for pred in preds]
     postprocessed_preds = [postprocess_output(pred) for pred in preds]
     return postprocessed_preds, preds

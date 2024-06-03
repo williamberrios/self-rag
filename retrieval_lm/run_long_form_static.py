@@ -1,3 +1,14 @@
+"""
+CUDA_VISIBLE_DEVICES=0 python run_long_form_static.py \
+  --model_name selfrag/selfrag_llama2_7b \
+  --ndocs 5 --max_new_tokens 300 --threshold 0.15 \
+  --use_grounding --use_utility --use_seqscore \
+  --task asqa --input_file eval_data/asqa_eval_gtr_top100.json \
+  --output_file repros/repro_asqa.json --max_depth 7 --mode always_retrieve
+
+
+"""
+
 import argparse
 import jsonlines
 from transformers import AutoTokenizer
@@ -6,7 +17,7 @@ import json
 import argparse
 from vllm import LLM, SamplingParams
 from utils import TASK_INST, PROMPT_DICT, load_special_tokens, load_jsonlines, postprocess, fix_spacing
-
+from tqdm import tqdm
 
 def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
                               rel_tokens=None, grd_tokens=None, ret_tokens=None, ut_tokens=None,
@@ -19,7 +30,7 @@ def run_step_generation_batch(model, prompt, paragraphs,  max_new_tokens,
 
     sampling_params = SamplingParams(
         temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32000, )
-    preds = model.generate(aug_prompts, sampling_params)
+    preds = model.generate(aug_prompts, sampling_params,use_tqdm = False)
 
     # compute the scores for each generation
     relevance_score_dict = {}
@@ -160,7 +171,7 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
         sampling_params = SamplingParams(
             temperature=0.0, top_p=1, max_tokens=max_new_tokens)
         prompt += "[No Retrieval]"
-        preds = model.generate([prompt], sampling_params)
+        preds = model.generate([prompt], sampling_params,use_tqdm = False)
         preds = [pred.outputs[0].text.split("\n\n")[0] for pred in preds]
         return preds[0], prediction_tree
 
@@ -171,7 +182,7 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
     else:
         sampling_params = SamplingParams(
             temperature=0.0, top_p=1, max_tokens=25, logprobs=32000)
-        preds = model.generate([prompt], sampling_params)
+        preds = model.generate([prompt], sampling_params,use_tqdm = False)
         pred_log_probs = preds[0].outputs[0].logprobs
         preds = [pred.outputs[0].text.split("\n\n")[0] for pred in preds]
         if "[Retrieval]" not in preds[0]:
@@ -205,6 +216,7 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
         prediction_tree[node_id] = {"prompt": prompt, "pred": "[Retrieval]",
                                     "processed_pred": "", "score": None, "ctx": None, "parent": None}
         levels[0] = [0]
+        # number of maximum retrievals intentions, also same to number of new segments that can be created before signing out:
         while curr_depth < max_depth:
             levels[curr_depth] = []
             if curr_depth-1 in levels and terminated is False:
@@ -222,15 +234,17 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
                             model, prompt + prev_generation, ctxs, max_new_tokens,
                             rel_tokens, ret_tokens=ret_tokens, grd_tokens=grd_tokens, ut_tokens=ut_tokens,
                             threshold=threshold, w_rel=w_rel, w_sup=w_sup, w_use=w_use)
+                        # preds are based on the top5 passages (or N preconfigured docs): they are the answers to the question
                         for i, (pred, p_score) in enumerate(zip(preds, scores)):
                             retrieval_results[i] = {
                                 "pred": pred, "score": p_score}
-
+                        # retrieval_results: score + pred for each passage
                         for i, result in retrieval_results.items():
                             node_id += 1
                             node_score = result["score"] * \
                                 score if score is not None else result["score"]
                             pred = result["pred"]
+                            # Prediction tree for each segment
                             prediction_tree[node_id] = {"prompt": prompt + prev_generation, "pred": pred,
                                                         "score": node_score, "ctx": ctxs[i], "parent": node,
                                                         "overall_score_dict": overall_score_dict}
@@ -242,7 +256,6 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
                                 prev_generation = pred
                             prediction_tree[node_id]["processed_pred"] = prev_generation
                             levels[curr_depth].append(node_id)
-
                 current_rank = levels[curr_depth]
                 node2score = {
                     node_id: prediction_tree[node_id]["score"] for node_id in current_rank}
@@ -293,7 +306,6 @@ def call_model_beam_batch(prompt, model, max_new_tokens=15, ctxs=None, query=Non
               "best_selections": best_selections,
               "ctxs": ctxs,
               "prediction_tree": prediction_tree}
-
     return final_prediction, result
 
 
@@ -387,14 +399,14 @@ def main():
     elif args.task is not None and (args.task in ["asqa", "eli5"]):
         new_results = {"data": [], "args": [],
                        "total_cost": 0.0, "azure_filter_fail": ""}
-        for instance_idx, item in enumerate(input_data):
+        for instance_idx, item in tqdm(enumerate(input_data), total=len(input_data), desc="Processing Inputs stuff"):
             prompt = item["question"]
             ctxs = item["docs"][:args.ndocs]
             instructions = TASK_INST[args.task]
             prev_gen = []
             prompt = instructions + "## Input:\n\n" + prompt
             final_pred, intermediate = generate(
-                prompt, ctxs, args.max_new_tokens,)
+                prompt, ctxs, args.max_new_tokens)
             final_output = ""
             docs = []
             prev_gen = []
@@ -413,7 +425,7 @@ def main():
                     else:
                         prev_gen.append(postprocessed_result)
                     final_output += postprocessed_result[:-
-                                                         1] + " [{}]".format(idx) + ". "
+                                                        1] + " [{}]".format(idx) + ". "
                     docs.append(doc)
                 if len(final_output) == 0:
                     item["output"] = fix_spacing(final_output)
@@ -427,10 +439,10 @@ def main():
             if "original_splitted_sentences" in intermediate:
                 item["intermediate"] = intermediate["original_splitted_sentences"][0]
             new_results["data"].append(item)
-
             if instance_idx % 10 == 0:
                 with open(args.output_file + "_tmp", 'w') as writer:
                     json.dump(new_results, writer)
+
         with open(args.output_file, 'w') as writer:
             json.dump(new_results, writer)
     else:

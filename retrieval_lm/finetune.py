@@ -420,7 +420,7 @@ def main():
         assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
     elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
         num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
-    
+    """
     elif ("llama3" in args.model_name_or_path) or ("llama-3" in args.model_name_or_path):
         if args.use_special_tokens is True:
             special_token_dict = {"additional_special_tokens": ["[No Retrieval]", "[Retrieval]", "[Continue to Use Evidence]", "[Irrelevant]", "[Relevant]", "<paragraph>", "</paragraph>", "[Utility:1]", "[Utility:2]", "[Utility:3]", "[Utility:4]", "[Utility:5]", "[Fully supported]", "[Partially supported]", "[No support / Contradictory]"]}
@@ -434,7 +434,7 @@ def main():
             assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
         else:
             assert num_added_tokens > 10, "special tokens must be added to the original tokenizers."
-    
+    """
 
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch

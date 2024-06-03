@@ -1,28 +1,97 @@
+"""
+cd /env/lib/repos/wbr/Self-GRIT/self-rag/retrieval_lm
+conda activate wbr-self-rag
+
+# POPQA
+python run_short_form.py \
+--model_name selfrag/selfrag_llama2_7b \
+--input_file eval_data/popqa_longtail_w_gs.jsonl \
+--mode adaptive_retrieval --max_new_tokens 100 \
+--threshold 0.2 \
+--output_file repros/repro_popqa.json \
+--download_dir ./model_cache \
+--metric match --ndocs 10 --use_groundness --use_utility --use_seqscore \
+--dtype half
+
+# TriviaQA
+cd /env/lib/repos/wbr/Self-GRIT/self-rag/retrieval_lm
+conda activate wbr-self-rag
+CUDA_VISIBLE_DEVICE=1 python run_short_form.py \
+--model_name selfrag/selfrag_llama2_7b \
+--input_file eval_data/triviaqa_test_w_gs.jsonl \
+--mode adaptive_retrieval --max_new_tokens 100 \
+--threshold 0.2 \
+--output_file repros/repro_triviaQA.json \
+--download_dir ./model_cache \
+--metric match --ndocs 10 --use_groundness --use_utility --use_seqscore \
+--dtype half
+
+# ARC_C
+CUDA_VISIBLE_DEVICES=0 python run_short_form.py \
+  --model_name selfrag/selfrag_llama2_7b \
+  --input_file eval_data/arc_challenge_processed.jsonl \
+  --max_new_tokens 50 --threshold 0.2 \
+  --output_file repros/repro_ARC_C.json \
+  --metric match --ndocs 5 --use_groundness --use_utility --use_seqscore \
+  --task arc_c
+
+
+
+# ======================
+## Trained Models
+# ======================
+# ARC_C
+# MODEL=/data/wberriosr/self-rag-exps/llama2-repro-LR_4e-5_GAS_32_MSEQ_4096_BS_1_WD_0.0_WU_0.03_EPOCHS_3/last_iteration
+MODEL=/data/wberriosr/self-rag-exps/self_rag_7B_8gpus_256_bs_origin_copy/
+CUDA_VISIBLE_DEVICES=1 python run_short_form.py \
+  --model_name $MODEL \
+  --input_file eval_data/arc_challenge_processed.jsonl \
+  --max_new_tokens 50 --threshold 0.3 \
+  --output_file repros/repro_ARC_C.json \
+  --metric match --ndocs 5 --use_groundness --use_utility --use_seqscore \
+  --task arc_c
+
+# POPQA
+# MODEL=/data/wberriosr/self-rag-exps/llama2-repro-LR_4e-5_GAS_32_MSEQ_4096_BS_1_WD_0.0_WU_0.03_EPOCHS_3/last_iteration
+MODEL=/data/wberriosr/self-rag-exps/self_rag_7B_8gpus_256_bs_origin_copy/
+CUDA_VISIBLE_DEVICES=1 python run_short_form.py \
+--model_name $MODEL \
+--input_file eval_data/popqa_longtail_w_gs.jsonl \
+--mode adaptive_retrieval --max_new_tokens 100 \
+--threshold 0.2 \
+--output_file repros/repro_popqa.json \
+--download_dir ./model_cache \
+--metric match --ndocs 10 --use_groundness --use_utility --use_seqscore \
+--dtype half
+
+MODEL=/data/wberriosr/self-rag-exps/self_rag_7B_8gpus_256_bs_origin/
+CUDA_VISIBLE_DEVICES=0 python run_short_form.py \
+--model_name $MODEL \
+--input_file eval_data/popqa_longtail_w_gs.jsonl \
+--mode adaptive_retrieval --max_new_tokens 100 \
+--threshold 0.2 \
+--output_file repros/repro_popqa.json \
+--download_dir ./model_cache \
+--metric match --ndocs 10 --use_groundness --use_utility --use_seqscore \
+--dtype half
+
+add stop id each segment? for stopiing sentence and then generate again and decide everything automatically.
+"""
 #!/usr/bin/python
 # -*- coding: UTF-8 -*-
 
-import spacy
-import jsonlines
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
+import os
 from vllm import LLM, SamplingParams
 import random
 import torch
-import os
 import numpy as np
-import openai
 from tqdm import tqdm
 import json
 import argparse
-import ast
-import re
 from tqdm import tqdm
-from collections import Counter
-import string
-import sys
-import time
 from utils import PROMPT_DICT, TASK_INST, load_jsonlines, control_tokens, load_special_tokens
 from metrics import match, accuracy
-
 
 seed = 633
 
@@ -56,7 +125,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
     if mode != "always_retrieve":
         sampling_params = SamplingParams(
             temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32016)
-        preds = model.generate([prompt], sampling_params)
+        preds = model.generate([prompt], sampling_params,use_tqdm = False)
         pred_token_ids = preds[0].outputs[0].token_ids
         pred_text = preds[0].outputs[0].text
         pred_log_probs = preds[0].outputs[0].logprobs
@@ -87,12 +156,13 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             para["title"], para["text"]) for para in evidences]
         sampling_params = SamplingParams(
             temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=5000)
-        preds = model.generate(evidence_augmented_inputs, sampling_params)
+        preds = model.generate(evidence_augmented_inputs, sampling_params,use_tqdm = False)
 
         relevance_score_dict = {}
         grd_score_dict = {}
         ut_score_dict = {}
         overall_scores = {}
+        # This base models only generate one sentence (so convinient for self-rag xD)
         for p_idx, pred in enumerate(preds):
             pred_token_ids = pred.outputs[0].token_ids
             pred_text = pred.outputs[0].text
@@ -170,7 +240,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
         sampling_params = SamplingParams(
             temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
         prompt += "[No Retrieval]"
-        preds = model.generate([prompt], sampling_params)
+        preds = model.generate([prompt], sampling_params,use_tqdm = False)
 
         pred = preds[0].outputs[0].text
 
@@ -299,6 +369,7 @@ def main():
         input_data, task=args.task)
     tokenizer = AutoTokenizer.from_pretrained(gpt, padding_side="left")
     if args.dtype is not None:
+        os.makedirs(args.download_dir, exist_ok=True)
         model = LLM(model=gpt, download_dir=args.download_dir,
                     dtype=args.dtype, tensor_parallel_size=args.world_size,)
     else:
@@ -312,7 +383,7 @@ def main():
     def generate(prompt, evidences, max_new_tokens):
         return call_model_rerank_w_scores_batch(prompt, evidences=evidences, model=model, max_new_tokens=max_new_tokens,
                                                 rel_tokens=rel_tokens, ret_tokens=ret_tokens, grd_tokens=grd_tokens, ut_tokens=ut_tokens,
-                                                threshold=args.threshold, max_depth=args.max_depth, use_seqscore=args.use_seqscore,
+                                                threshold=args.threshold, use_seqscore=args.use_seqscore,
                                                 w_rel=args.w_rel, w_sup=args.w_sup, w_use=args.w_use, mode=args.mode, closed=args.task in ["fever", "arc_c"])
 
     preds = []
@@ -322,7 +393,7 @@ def main():
     scores = []
     all_results = []
     count = 0
-    for i, row in tqdm(enumerate(input_data)):
+    for i, row in tqdm(enumerate(input_data), total=len(input_data)):
         results = {}
         prompt = PROMPT_DICT["prompt_no_input"].format_map(row)
         _, evidences = process_data_evidences(row, top_n=args.ndocs)
@@ -352,7 +423,7 @@ def main():
 
         metric_results.append(metric_result)
         if i % 10 == 0:
-            print("average: {}".format(np.mean(metric_results)))
+            #print("average: {}".format(np.mean(metric_results)))
             final_results = {"preds": preds, "prompts": prompts, "metric_results": metric_results, "all_results": all_results,
                              "golds": golds,  "metric":  args.metric, "metric_mean": np.mean(metric_results), "scores": scores}
             with open(args.output_file + "_tmp", "w") as outfile:
